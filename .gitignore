@@ -1,0 +1,15 @@
+*.safetensors
+*.bin
+*.pth
+*.model
+checkpoint-*/
+outputs/
+final_model/
+*.jsonl
+*.csv
+train_log.txt
+nohup.out
+__pycache__/
+wandb/
+.ipynb_checkpoints/
+kernel_meta/

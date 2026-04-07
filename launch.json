@@ -1,0 +1,57 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Qwen-VL Train (OBS Support)",
+            "type": "python",
+            "request": "launch",
+            "program": "/home/ma-user/work/h00905264/sft_qwen3/sft_qwen2_5.py", // Path to your training script
+            "python": "/home/ma-user/anaconda3/envs/qwen_sft_hf/bin/python", // Your Python interpreter path
+            "args": [
+                // Optional command-line arguments (add/remove as needed)
+                // "--model_path", "/home/ma-user/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-3B-Instruct",
+            ],
+            "cwd": "${workspaceFolder}", // Working directory (project root)
+            "env": {
+                "PYTHONUNBUFFERED": "1", // Ensure stdout/stderr are unbuffered for real-time logging
+                "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7", // Specify GPU device (adjust based on your setup)
+                "TRANSFORMERS_VERBOSITY": "info", // Log level for transformers library
+                "TORCH_CUDNN_V8_API_ENABLED": "1" // Enable CUDNN v8 API for better performance
+            },
+            "envFile": "${workspaceFolder}/.env", // Optional: Load environment variables from .env file
+            "stopOnEntry": false, // Do not stop at the first line of the program
+            "justMyCode": false, // Debug into external libraries (transformers/torch) if needed
+            "redirectOutput": true, // Redirect debug output to VS Code console
+            "console": "integratedTerminal", // Use VS Code integrated terminal for output
+            "logging": {
+                "moduleLoad": false, // Disable logging of module loading events
+                "trace": false // Disable detailed debug tracing
+            },
+            "subProcess": true, // Debug child processes (important for multiprocessing in training)
+            "argsExpansion": "auto", // Automatically expand arguments with environment variables
+            "gevent": false // Disable gevent monkey patching (not needed for PyTorch training)
+        },
+        {
+            "name": "Qwen-VL Inference Test",
+            "type": "python",
+            "request": "launch",
+            "python": "/home/ma-user/anaconda3/envs/qwen_sft_hf/bin/python", // Your Python interpreter path
+            "program": "/home/ma-user/work/h00905264/sft_qwen3/infer_qwen2_5.py", // Path to your inference test script
+            "args": [
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONUNBUFFERED": "1", // Ensure stdout/stderr are unbuffered for real-time logging
+                "ASCEND_RT_VISIBLE_DEVICES": "0", // Specify GPU device (adjust based on your setup)
+                "TRANSFORMERS_VERBOSITY": "info", // Log level for transformers library
+                "TORCH_CUDNN_V8_API_ENABLED": "1" // Enable CUDNN v8 API for better performance
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        }
+    ]
+}
