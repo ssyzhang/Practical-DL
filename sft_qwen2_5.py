@@ -28,7 +28,8 @@ current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 # OBS相关依赖
 import moxing as mox
 os.environ["WANDB_API_KEY"] = "wandb_v1_Q5ZzrTzWfu48zOxZNzmByMXJhcm"
-os.environ["WANDB_PROJECT"] = "qwen2.5-vl-recogdrive"
+# os.environ["WANDB_ENTITY"] = "siyuanzhang"
+os.environ["WANDB_PROJECT"] = "qwen2.5-vl-sft"
 os.environ["WANDB_NAME"] = f"run_{current_time}"
 # 视频加载相关依赖（按需安装）
 try:
@@ -166,10 +167,10 @@ def train_qwen_vl(
         warmup_ratio=0.05,
         weight_decay=0.01,
         
-        logging_steps=1,         # 每 10 步记录一次 train loss
-        save_steps=2,
+        logging_steps=20,         # 每 10 步记录一次 train loss
+        save_steps=200,
         eval_strategy="steps",    # <--- 新增：按步数进行验证
-        eval_steps=2,           # <--- 新增：每 100 步验证一次
+        eval_steps=200,           # <--- 新增：每 100 步验证一次
         save_total_limit=1,
 
         fp16=False,
