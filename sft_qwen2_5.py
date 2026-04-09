@@ -22,7 +22,7 @@ from transformers import (
     # requires_backends
 )
 from transformers import trainer_utils
-from qwen_dataset import QwenLazySupervisedDataset, DataCollatorForSupervisedDataset, make_supervised_data_module
+from qwen_dataset import QwenLazySupervisedDataset, DataCollatorForSupervisedDataset, make_supervised_data_module,load_image
 from datetime import datetime
 
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -274,8 +274,13 @@ if __name__ == "__main__":
     TRAIN_JSONL_PATH = "/home/ma-user/work/data/dataset_navsim_traj_renamed.jsonl"
     OUTPUT_DIR = "/home/ma-user/work/outputs"
 
-    # ...(省略OBS测试代码)...
-
+    # OBS连通测试
+    test_obs_path = "obs://yw-2030-extern/Partner_Zhu/navsim/navsim-data/sensor_blobs/trainval/2021.06.14.13.27.42_veh-35_04894_05018/CAM_F0/cb2fc291d79f5b66.jpg"
+    try:
+        test_img = load_image(test_obs_path,10.0)
+        print(f"OBS图片加载测试成功，图片尺寸: {test_img.size}")
+    except Exception as e:
+        print(f"OBS图片加载测试失败: {e}")
     # 启动训练
     train_qwen_vl(
         model_path=MODEL_PATH,
