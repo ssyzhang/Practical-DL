@@ -1,282 +1,197 @@
-# 杀掉所有占用 NPU 的 python 进程
-fuser -k /dev/davinci* ```
-*(执行完后可以输入 `npu-smi info` 检查一下，确保每张卡的 Memory Usage 都是几十 MB 的干净状态)*
-
-#### 第二步：修改评测代码
-我已经针对上述 2 和 3 的问题修改了代码：
-1.  **限制图片分辨率**：在读取图片时加入了 `img.thumbnail((1024, 1024))`，防止动态序列过长炸显存。
-2.  **移除硬编码的 Flash Attention**：改为使用模型默认的 SDPA，规避升腾底层算子的 Bug。
-3.  **强制转换 token_id**：将 `eos_token_id` 转换为安全的 `list` 格式。
-
-请将你的 `eval_batch_multi_npu.py` 或 `test_single.py` 替换为以下代码：
-
-```python
 import os
-import re
-import math
 import json
 import torch
-import logging
-from PIL import Image
+import re
+import math
+import numpy as np
+import multiprocessing as mp
 from tqdm import tqdm
+from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from peft import PeftModel
 import moxing as mox
-import torch.multiprocessing as mp
 
 try:
     import torch_npu
-    from torch_npu.contrib import transfer_to_npu
+    from torch_npu.contrib import transfer_to_npu # 自动将部分 cuda 调用重定向到 npu
 except ImportError:
     pass
 
-# ===================== 日志配置 =====================
-def setup_logger(log_dir: str = "./eval_logs", rank: int = 0):
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"eval_batch_rank{rank}.log")
-    log_format = logging.Formatter(
-        f"%(asctime)s - Rank {rank} - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    logger = logging.getLogger(f"Eval-Batch-{rank}")
-    logger.handlers = []
-    logger.setLevel(logging.INFO)
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(log_format)
-    logger.addHandler(file_handler)
-    
-    if rank == 0:
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(log_format)
-        logger.addHandler(console_handler)
-        
-    return logger
+# ===================== 配置 =====================
+BASE_MODEL_PATH = "/home/ma-user/work/download/models/qwen/Qwen2.5-VL-3B-Instruct"
+CHECKPOINT_PATH = "/home/ma-user/work/outputs/traj_stage2_model"
+EVAL_DATA_PATH = "/home/ma-user/work/outputs/eval_traj.jsonl"  # 你的评测文件路径
+NUM_GPUS = 8 # 设置使用的 NPU 卡数
 
 # ===================== 工具函数 =====================
-def extract_trajectory_points(text: str) -> list:
-    numbers = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
-    return [float(n) for n in numbers]
-
-def calculate_ade(pred_pts: list, gt_pts: list) -> float:
-    if len(pred_pts) != 16 or len(gt_pts) != 16:
-        return -1.0
-    
-    total_error = 0.0
-    for i in range(8):
-        x_pred, y_pred = pred_pts[i*2], pred_pts[i*2 + 1]
-        x_gt, y_gt = gt_pts[i*2], gt_pts[i*2 + 1]
-        distance = math.sqrt((x_pred - x_gt)**2 + (y_pred - y_gt)**2)
-        total_error += distance
-    return total_error / 8
-
-def load_image_from_obs(image_path: str, logger) -> Image.Image:
-    try:
+def load_image(image_path: str) -> Image.Image:
+    if image_path.startswith("obs://"):
         with mox.file.File(image_path, "rb") as f:
             img = Image.open(f).convert("RGB")
-        
-        # 【核心修复1】: 限制图片最大分辨率，防止 Qwen2-VL 动态分块导致序列爆炸引发 NPU OOM
-        img.thumbnail((1024, 1024)) 
-        return img
-    except Exception as e:
-        logger.error(f"图片加载失败 {image_path}: {e}")
+    else:
+        img = Image.open(image_path).convert("RGB")
+    return img
+
+def extract_points(text: str):
+    """
+    使用正则表达式从文本中提取 (x, y, h) 坐标点
+    返回格式: [(x1, y1), (x2, y2), ...]
+    """
+    pattern = r"\(([-+]?\d+\.\d+),\s*([-+]?\d+\.\d+),\s*([-+]?\d+\.\d+)\)"
+    matches = re.findall(pattern, text)
+    points = []
+    for m in matches:
+        points.append((float(m[0]), float(m[1])))
+    return points
+ 
+def calculate_ade(gt_points, pred_points):
+    """计算单条数据的 ADE"""
+    if len(gt_points) == 0 or len(pred_points) == 0:
         return None
-
-# ===================== 单个进程的工作函数 =====================
-def worker(rank: int, world_size: int, data_chunk: list, base_model_path: str, checkpoint_path: str, tmp_dir: str):
-    logger = setup_logger(rank=rank)
     
-    device_name = f"npu:{rank}" if hasattr(torch, 'npu') and torch.npu.is_available() else f"cuda:{rank}"
-    if 'npu' in device_name:
-        torch.npu.set_device(device_name)
-    else:
-        torch.cuda.set_device(device_name)
-        
-    logger.info(f"进程启动，分配设备: {device_name}，分发到 {len(data_chunk)} 条数据")
-
-    processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
+    min_len = min(len(gt_points), len(pred_points))
+    gt_pts = np.array(gt_points[:min_len])
+    pred_pts = np.array(pred_points[:min_len])
     
-    # 【核心修复2】: 移除硬编码的 attn_implementation="flash_attention_2"，交由底层自行路由，规避 NPU 长序列 Bug
-    if os.path.exists(os.path.join(checkpoint_path, "adapter_config.json")):
-        base_model = AutoModelForImageTextToText.from_pretrained(
-            base_model_path, torch_dtype=torch.bfloat16, device_map={"": device_name},
-            trust_remote_code=True
-        )
-        model = PeftModel.from_pretrained(base_model, checkpoint_path)
-    else:
-        model = AutoModelForImageTextToText.from_pretrained(
-            checkpoint_path, torch_dtype=torch.bfloat16, device_map={"": device_name},
-            trust_remote_code=True
-        )
+    distances = np.linalg.norm(gt_pts - pred_pts, axis=1)
+    return np.mean(distances)
+
+# ===================== 单卡推理 Worker =====================
+def worker_evaluate(rank: int, data_chunk: list, return_dict: dict):
+    """
+    每个进程执行的函数，在指定的卡（rank）上运行分配到的数据子集
+    """
+    device = f"npu:{rank}"
+    # 可选：显式设置当前设备的 NPU context
+    if hasattr(torch, 'npu'):
+        torch.npu.set_device(device)
+
+    print(f"[进程 {rank}] 启动成功，分配到 NPU: {rank}，负责 {len(data_chunk)} 条数据。")
+    
+    # 1. 在当前进程和对应的卡上加载模型
+    processor = AutoProcessor.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
+    model = AutoModelForImageTextToText.from_pretrained(
+        CHECKPOINT_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map=device, # 将模型加载到指定的卡
+        trust_remote_code=True
+    )
     model.eval()
 
-    # 【核心修复3】: 提取并清洗 eos_token_id，防止其为 Tensor 导致生成函数死循环
-    eos_ids = processor.tokenizer.eos_token_id
-    if isinstance(eos_ids, torch.Tensor):
-        eos_ids = eos_ids.tolist()
-    elif not isinstance(eos_ids, list):
-        eos_ids = [eos_ids]
+    results = []
+    ade_list = []
 
-    valid_count = 0
-    total_ade = 0.0
-    results_log = []
-
-    pbar = tqdm(data_chunk, desc=f"Rank {rank}", position=rank, unit="条")
-    
-    for item in pbar:
-        data_id = item.get("id", "unknown")
-        obs_image_path = item["image"][0]
+    # 2. 遍历推理当前卡负责的数据
+    # 使用 position 使得多进程的 tqdm 打印不会互相干扰
+    for item in tqdm(data_chunk, desc=f"NPU {rank}", position=rank, leave=False):
+        img_path = item["image"]
+        gt_text = item["conversations"][2]["value"]
+        gt_pts = extract_points(gt_text)
         
-        prompt, gt_text = "", ""
-        for msg in item["conversations"]:
-            if msg["from"] == "human":
-                prompt = msg["value"].replace("<image>\n", "").replace("<image>", "") 
-            elif msg["from"] == "gpt":
-                gt_text = msg["value"]
+        image_obj = load_image(img_path)
+        
+        sys_p = item["conversations"][0]["value"]
+        user_p = item["conversations"][1]["value"].replace("<image>\n", "").replace("<image>", "")
+        
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": sys_p}]},
+            {"role": "user", "content": [
+                {"type": "image", "image": image_obj},
+                {"type": "text", "text": user_p}
+            ]}
+        ]
 
-        image = load_image_from_obs(obs_image_path, logger)
-        if image is None:
-            results_log.append({"id": data_id, "error": "Image Load Failed"})
-            continue
-
-        try:
-            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
-            text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=[text_input], images=[image], return_tensors="pt").to(device_name)
-
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False, 
-                    pad_token_id=processor.tokenizer.pad_token_id if processor.tokenizer.pad_token_id is not None else eos_ids[0],
-                    eos_token_id=eos_ids # 传入清洗后的 eos_ids
-                )
-            
-            generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-            pred_text = processor.decode(generated_ids, skip_special_tokens=True).strip()
-
-            gt_pts = extract_trajectory_points(gt_text)
-            pred_pts = extract_trajectory_points(pred_text)
-            
-            if len(gt_pts) > 16: gt_pts = gt_pts[:16]
-            if len(pred_pts) > 16: pred_pts = pred_pts[:16]
-
-            ade_val = calculate_ade(pred_pts, gt_pts)
-            
-            if ade_val >= 0:
-                total_ade += ade_val
-                valid_count += 1
-                results_log.append({"id": data_id, "pred": pred_pts, "gt": gt_pts, "ade": round(ade_val, 4)})
-            else:
-                results_log.append({"id": data_id, "error": "Invalid Output Format", "pred_raw": pred_text})
-                
-        except Exception as e:
-            logger.error(f"推理错误 ID: {data_id} -> {e}")
-            results_log.append({"id": data_id, "error": str(e)})
-
-    os.makedirs(tmp_dir, exist_ok=True)
-    tmp_file = os.path.join(tmp_dir, f"result_rank_{rank}.json")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump({"total_ade": total_ade, "valid_count": valid_count, "details": results_log}, f, ensure_ascii=False)
-    
-    logger.info(f"进程 {rank} 推理结束，已保存临时结果。")
-
-# ===================== 主调度器 =====================
-def evaluate_batch_multi_gpu(
-    base_model_path: str,
-    checkpoint_path: str,
-    json_data_path: str,
-    output_result_path: str,
-    world_size: int = 8,
-    max_samples: int = 40
-):
-    print("="*50)
-    print(f"🚀 开始 {world_size} 卡并行批量评测流程")
-    print("="*50)
-
-    if json_data_path.startswith("obs://"):
-        with mox.file.File(json_data_path, "r") as f:
-            data = json.load(f)
-    else:
-        with open(json_data_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    
-    if max_samples:
-        data = data[:max_samples]
-    total_samples = len(data)
-    print(f"✅ 共读取 {total_samples} 条测试数据，将均分给 {world_size} 张卡...")
-
-    data_chunks = [data[i::world_size] for i in range(world_size)]
-    tmp_dir = "./tmp_eval_results"
-
-    mp.set_start_method("spawn", force=True)
-    
-    processes = []
-    for rank in range(world_size):
-        if len(data_chunks[rank]) == 0:
-            continue 
-            
-        p = mp.Process(
-            target=worker, 
-            args=(rank, world_size, data_chunks[rank], base_model_path, checkpoint_path, tmp_dir)
+        text_prompt = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-        p.start()
-        processes.append(p)
+
+        inputs = processor(
+            text=[text_prompt], images=[image_obj], return_tensors="pt"
+        ).to(device)
         
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs, 
+                max_new_tokens=512, 
+                do_sample=False,
+                pad_token_id=processor.tokenizer.eos_token_id,
+                use_cache=True
+            )
+            response = processor.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+        pred_pts = extract_points(response)
+        ade = calculate_ade(gt_pts, pred_pts)
+        
+        if ade is not None:
+            ade_list.append(ade)
+            results.append({
+                "id": item.get("id"),
+                "ade": ade,
+                "gt_count": len(gt_pts),
+                "pred_count": len(pred_pts)
+            })
+
+    # 3. 将当前进程的结果保存到共享字典中
+    return_dict[rank] = {
+        "ade_list": ade_list,
+        "results": results
+    }
+    print(f"[进程 {rank}] 推理完成！")
+
+# ===================== 主流程与并行调度 =====================
+def run_evaluation_multigpu():
+    # 注意：在多卡/NPU环境下，必须使用 spawn 启动模式才能正确初始化 CUDA/NPU 上下文
+    mp.set_start_method('spawn', force=True)
+    
+    print(f"正在读取评测数据: {EVAL_DATA_PATH}")
+    with open(EVAL_DATA_PATH, 'r', encoding='utf-8') as f:
+        samples = [json.loads(line) for line in f]
+    
+    total_samples = len(samples)
+    print(f"数据读取完成，共 {total_samples} 条数据。准备启动 {NUM_GPUS} 卡并行推理...")
+
+    # 1. 均分数据集
+    chunk_size = math.ceil(total_samples / NUM_GPUS)
+    data_chunks = [samples[i:i + chunk_size] for i in range(0, total_samples, chunk_size)]
+    actual_gpus = len(data_chunks) # 如果数据量太少，可能分不满 8 份
+
+    # 2. 创建多进程管理器来收集结果
+    manager = mp.Manager()
+    return_dict = manager.dict()
+    processes = []
+
+    # 3. 启动多进程
+    for rank in range(actual_gpus):
+        p = mp.Process(target=worker_evaluate, args=(rank, data_chunks[rank], return_dict))
+        processes.append(p)
+        p.start()
+
+    # 4. 等待所有进程结束
     for p in processes:
         p.join()
 
-    print("\n\n" + "="*50)
-    print("[4/4] 所有进程执行完毕，正在汇总结果...")
-    
-    global_valid_count = 0
-    global_total_ade = 0.0
-    global_details = []
-    
-    for rank in range(world_size):
-        tmp_file = os.path.join(tmp_dir, f"result_rank_{rank}.json")
-        if os.path.exists(tmp_file):
-            with open(tmp_file, "r", encoding="utf-8") as f:
-                res = json.load(f)
-                global_total_ade += res["total_ade"]
-                global_valid_count += res["valid_count"]
-                global_details.extend(res["details"])
-            os.remove(tmp_file)
+    # 5. 汇总所有卡的结果
+    all_ade_list = []
+    all_results = []
+    for rank in range(actual_gpus):
+        if rank in return_dict:
+            all_ade_list.extend(return_dict[rank]["ade_list"])
+            all_results.extend(return_dict[rank]["results"])
 
-    final_mean_ade = (global_total_ade / global_valid_count) if global_valid_count > 0 else -1
-    
-    summary = {
-        "total_samples": total_samples,
-        "valid_samples": global_valid_count,
-        "failed_samples": total_samples - global_valid_count,
-        "mean_ade": final_mean_ade,
-        "details": global_details
-    }
-
-    with open(output_result_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=4, ensure_ascii=False)
-
-    print(f"🎉 评测汇总报告 🎉")
-    print(f"配置: {world_size} NPU 并行")
-    print(f"总数据量: {total_samples}")
-    print(f"成功计算: {global_valid_count}")
-    print(f"失败/异常: {total_samples - global_valid_count}")
-    if global_valid_count > 0:
-        print(f"🌟 最终平均 ADE 指标: {final_mean_ade:.4f}")
-    print(f"详细日志已保存至: {output_result_path}")
-    print("="*50)
+    # 6. 输出最终统计结果
+    if all_ade_list:
+        final_ade = np.mean(all_ade_list)
+        print("\n" + "="*40)
+        print("🎉 8卡并行评测全部完成！")
+        print(f"样本总数: {total_samples}")
+        print(f"成功计算数: {len(all_ade_list)}")
+        print(f"平均 ADE: {final_ade:.4f} 米")
+        print("="*40)
+        
+        with open("eval_results.json", "w", encoding='utf-8') as f:
+            json.dump({"average_ade": final_ade, "total_samples": len(all_results), "details": all_results}, f, indent=4)
+        print("详细结果已保存至 eval_results.json")
+    else:
+        print("未成功计算任何 ADE，请检查模型输出或真值格式。")
 
 if __name__ == "__main__":
-    BASE_MODEL_PATH = "/home/ma-user/work/download/models/qwen/Qwen2.5-VL-3B-Instruct"
-    CHECKPOINT_PATH = "/home/ma-user/work/outputs/cp7500" 
-    DATA_JSON_PATH = "/home/ma-user/work/data/navsim_1view_4s_onlytraj_668k.json" 
-    OUTPUT_RESULT_PATH = "./batch_eval_ade_multi_npu_results.json"
-
-    evaluate_batch_multi_gpu(
-        base_model_path=BASE_MODEL_PATH,
-        checkpoint_path=CHECKPOINT_PATH,
-        json_data_path=DATA_JSON_PATH,
-        output_result_path=OUTPUT_RESULT_PATH,
-        world_size=8,
-        max_samples=40 
-    )
+    run_evaluation_multigpu()

@@ -31,7 +31,7 @@ import moxing as mox
 
 os.environ["WANDB_API_KEY"] = "wandb_v1_Q5ZzrTzWfu48zOxZNzmByMXJhcm"
 # 
-os.environ["WANDB_PROJECT"] = "qwen2.5-vl-sft-traj"
+os.environ["WANDB_PROJECT"] = "qwen2.5-vl-sft-coc"
 WANDB_ID = os.environ.get("WANDB_RUN_ID", None)
 if WANDB_ID:
     os.environ["WANDB_RESUME"] = "allow"
@@ -115,8 +115,8 @@ def split_jsonl_file_traj(input_path: str, output_dir: str, interval: int = 500)
     """
     按行读取原始 JSONL 文件，每隔 interval 条抽取一条作为 eval，其余作为 train
     """
-    train_path = os.path.join(output_dir, "traj_train_split_mixed.jsonl")
-    eval_path = os.path.join(output_dir, "traj_eval_split.jsonl")
+    train_path = os.path.join(output_dir, "train_coc.jsonl")
+    eval_path = os.path.join(output_dir, "eval_coc.jsonl")
     
     # 如果文件已存在则不重新切分
     if os.path.exists(train_path) and os.path.exists(eval_path):
@@ -230,11 +230,11 @@ def train_qwen_vl(
         weight_decay=0.01,
         
         logging_steps=20,         # 每 10 步记录一次 train loss
-        save_steps=200,
-        eval_strategy="no",    # <--- 新增：按步数进行验证
-        eval_steps=200,           # <--- 新增：每 100 步验证一次
+        save_steps=100,
+        eval_strategy="steps",    # <--- 新增：按步数进行验证
+        eval_steps=100,           # <--- 新增：每 100 步验证一次
         save_total_limit=1,
-        max_steps=4000,   # 固定
+        max_steps=2000,   # 固定
         num_train_epochs=100,
         fp16=False,
         bf16=True,
@@ -262,7 +262,7 @@ def train_qwen_vl(
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     # 8. 保存模型
-    final_model_path = os.path.join(output_dir, "traj_stage2_model")
+    final_model_path = os.path.join(output_dir, "coc_stage3_model")
     trainer.save_model(final_model_path)
     processor.save_pretrained(final_model_path)
     print(f"训练完成！模型保存至: {final_model_path}")
@@ -270,8 +270,8 @@ def train_qwen_vl(
 # ===================== 7. 快速启动入口 =====================
 if __name__ == "__main__":
     # 配置参数
-    MODEL_PATH = "/home/ma-user/work/outputs/recogdrive_stage1_model"
-    TRAIN_JSONL_PATH = "/home/ma-user/work/data/dataset_navsim_traj_renamed.jsonl"
+    MODEL_PATH = "/home/ma-user/work/outputs/traj_stage2_model"
+    TRAIN_JSONL_PATH = "/home/ma-user/work/data/navsim_coc_42106_8pts_renamed.jsonl"
     OUTPUT_DIR = "/home/ma-user/work/outputs"
 
     # OBS连通测试

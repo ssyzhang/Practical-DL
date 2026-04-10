@@ -108,11 +108,63 @@ def merge_and_shuffle_datasets(path_a, path_b, output_path, sample_a_count=8000,
             
     print(f"成功！混合数据集已保存至: {output_path}")
 
+
+
+def add_system_prompt_to_jsonl(input_file, output_file, system_value=None):
+    """
+    为没有 system 提示词的数据集统一添加 system 角色
+    """
+    # 如果不指定，使用一个通用的自动驾驶感知任务描述
+    if system_value is None:
+        system_value = "You are a professional autonomous driving perception assistant. Analyze the driving scene images and provide accurate descriptions or reasoning based on the visual information."
+
+    print(f"开始处理: {input_file}")
+    
+    processed_count = 0
+    with open(input_file, 'r', encoding='utf-8') as f_in, \
+         open(output_file, 'w', encoding='utf-8') as f_out:
+        
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            
+            try:
+                data = json.loads(line)
+                convs = data.get("conversations", [])
+                
+                # 检查第一条是否已经是 system
+                if len(convs) > 0 and convs[0]["from"] == "system":
+                    # 如果已经有了，可以选择跳过或者替换（这里选择保留原有的）
+                    pass
+                else:
+                    # 构造新的 system 节点
+                    new_system = {
+                        "from": "system",
+                        "value": system_value
+                    }
+                    # 将 system 插入到对话列表的最前面
+                    data["conversations"] = [new_system] + convs
+                    processed_count += 1
+                
+                # 写入新文件
+                f_out.write(json.dumps(data, ensure_ascii=False) + '\n')
+                
+            except Exception as e:
+                print(f"处理行报错: {e}")
+
+    print(f"处理完成！")
+    print(f"共为 {processed_count} 条数据补充了 system 提示词。")
+    print(f"结果保存至: {output_file}")
+
+
+
+
 # --- 配置参数 ---
 # 注意：path_a 建议使用你刚刚拆分出来的“单轮对话版”数据集
-dataset_a_path = "/home/ma-user/work/data/dataset_navsim_recogdrive_single.jsonl" 
-dataset_b_path = "/home/ma-user/work/outputs/traj_train_split.jsonl"
-final_output_path = "/home/ma-user/work/outputs/traj_train_split_mixed.jsonl"
+dataset_a_path = "/home/ma-user/work/data/dataset_navsim_recogdrive_single_system.jsonl" 
+dataset_b_path = "/home/ma-user/work/outputs/train_traj.jsonl"
+final_output_path = "/home/ma-user/work/outputs/train_traj_mixed.jsonl"
 
 merge_and_shuffle_datasets(
     path_a=dataset_a_path,
@@ -121,5 +173,26 @@ merge_and_shuffle_datasets(
     sample_a_count=8000,
     seed=42
 )
+
+
+
+
+
+# # --- 运行配置 ---
+# # 建议在混合数据集之前，先对 Dataset A 运行这个程序
+# input_path = "/home/ma-user/work/data/dataset_navsim_recogdrive_single.jsonl" 
+# output_path = "/home/ma-user/work/data/dataset_navsim_recogdrive_single_system.jsonl"
+
+# # 你可以根据 Dataset A 的具体内容自定义这个 system 内容
+# my_system_content = "You are a helpful assistant specialized in driving scene understanding and road safety analysis."
+
+# add_system_prompt_to_jsonl(input_path, output_path, system_value=my_system_content)
+
+
+
+
+
+
+
 # # --- 运行 ---
 # split_multi_turn_to_single("/home/ma-user/work/data/dataset_navsim_recogdrive_renamed.jsonl", "/home/ma-user/work/data/dataset_navsim_recogdrive_single.jsonl")
